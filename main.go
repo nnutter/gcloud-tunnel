@@ -32,16 +32,8 @@ func newCommand() *cobra.Command {
 		Args:    cobra.ExactArgs(1),
 		RunE: func(command *cobra.Command, arguments []string) error {
 			harness.workstation = arguments[0]
-
-			harness.run = func(ctx context.Context, name string, arg ...string) error {
-				cmd := exec.CommandContext(ctx, name, arg...)
-				cmd.Stdin = command.InOrStdin()
-				cmd.Stdout = command.OutOrStdout()
-				cmd.Stderr = command.ErrOrStderr()
-				return cmd.Run()
-			}
-
-			return harness.startTunnels(command.Context())
+			harness.run = runGcloud
+			return harness.runDashboard(command.Context(), command.InOrStdin(), command.OutOrStdout())
 		},
 	}
 
@@ -61,4 +53,8 @@ func newCommand() *cobra.Command {
 		}
 	}
 	return command
+}
+
+func runGcloud(ctx context.Context, name string, arguments ...string) error {
+	return exec.CommandContext(ctx, name, arguments...).Run()
 }
