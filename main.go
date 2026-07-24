@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"io"
 	"os"
 	"os/exec"
 	"syscall"
@@ -16,6 +17,7 @@ func main() {
 		context.Background(),
 		command,
 		fang.WithColorSchemeFunc(tunnelColorScheme),
+		fang.WithErrorHandler(renderError),
 		fang.WithNotifySignal(os.Interrupt, syscall.SIGTERM),
 	)
 	if err != nil {
@@ -56,5 +58,12 @@ func newCommand() *cobra.Command {
 }
 
 func runGcloud(ctx context.Context, name string, arguments ...string) error {
-	return exec.CommandContext(ctx, name, arguments...).Run()
+	command := exec.CommandContext(ctx, name, arguments...)
+	var stderr tailBuffer
+	command.Stdout = io.Discard
+	command.Stderr = &stderr
+	if err := command.Run(); err != nil {
+		return gcloudError(err, stderr.String())
+	}
+	return nil
 }

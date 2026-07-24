@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
@@ -25,11 +26,13 @@ const (
 	statusStarting tunnelStatus = "STARTING"
 	statusOpen     tunnelStatus = "OPEN"
 	statusWaiting  tunnelStatus = "WAITING"
+	statusUnknown  tunnelStatus = "UNKNOWN"
 	statusStopped  tunnelStatus = "STOPPED"
 )
 
 type mappingStatus struct {
 	mapping portMapping
+	probe   portMapping
 	status  tunnelStatus
 }
 
@@ -48,35 +51,56 @@ type tunnelsStoppedMsg struct {
 	err error
 }
 
-type dashboardModel struct {
-	ctx           context.Context
-	mappings      []mappingStatus
-	probe         portProbe
-	tunnelResults <-chan error
-	failure       error
-	stopped       bool
+type probeTunnelResult struct {
+	index int
+	err   error
 }
 
-func newDashboard(
-	ctx context.Context,
-	mappings portMappings,
-	tunnelResults <-chan error,
-	probe portProbe,
-) dashboardModel {
-	statuses := make([]mappingStatus, len(mappings))
-	for index, mapping := range mappings {
-		statuses[index] = mappingStatus{mapping: mapping, status: statusStarting}
+type probeTunnelStoppedMsg struct {
+	index int
+	err   error
+}
+
+type dashboardConfig struct {
+	ctx                context.Context
+	mappings           portMappings
+	probeMappings      portMappings
+	tunnelResults      <-chan error
+	probeTunnelResults <-chan probeTunnelResult
+	probe              portProbe
+}
+
+type dashboardModel struct {
+	ctx                context.Context
+	mappings           []mappingStatus
+	probe              portProbe
+	tunnelResults      <-chan error
+	probeTunnelResults <-chan probeTunnelResult
+	failure            error
+	probeFailure       error
+	stopped            bool
+}
+
+func newDashboard(config dashboardConfig) dashboardModel {
+	statuses := make([]mappingStatus, len(config.mappings))
+	for index, mapping := range config.mappings {
+		statuses[index] = mappingStatus{
+			mapping: mapping,
+			probe:   config.probeMappings[index],
+			status:  statusStarting,
+		}
 	}
 	return dashboardModel{
-		ctx:           ctx,
-		mappings:      statuses,
-		probe:         probe,
-		tunnelResults: tunnelResults,
+		ctx:                config.ctx,
+		mappings:           statuses,
+		probe:              config.probe,
+		tunnelResults:      config.tunnelResults,
+		probeTunnelResults: config.probeTunnelResults,
 	}
 }
 
 func (model dashboardModel) Init() tea.Cmd {
-	return tea.Batch(model.probeMappings(), model.waitForTunnels())
+	return tea.Batch(model.probeMappings(), model.waitForTunnels(), model.waitForProbeTunnels())
 }
 
 func (model dashboardModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
@@ -97,6 +121,10 @@ func (model dashboardModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			model.mappings[index].status = statusStopped
 		}
 		return model, tea.Quit
+	case probeTunnelStoppedMsg:
+		model.mappings[message.index].status = statusUnknown
+		model.recordProbeFailure(message)
+		return model, model.waitForProbeTunnels()
 	}
 	return model, nil
 }
@@ -119,6 +147,8 @@ func (model dashboardModel) View() tea.View {
 		lines = append(lines, errorStyle.Render(model.failure.Error()))
 	} else if model.stopped {
 		lines = append(lines, dimStyle.Render("Tunnels stopped."))
+	} else if model.probeFailure != nil {
+		lines = append(lines, waitStyle.Render(model.probeFailure.Error()))
 	} else {
 		lines = append(lines, dimStyle.Render("TCP checks every 2s. Press q to stop."))
 	}
@@ -132,7 +162,7 @@ func (model dashboardModel) probeMappings() tea.Cmd {
 		var group errgroup.Group
 		for index, mapping := range mappings {
 			group.Go(func() error {
-				results[index] = probeResult{index: index, err: model.probe(model.ctx, mapping.mapping)}
+				results[index] = probeResult{index: index, err: model.probe(model.ctx, mapping.probe)}
 				return nil
 			})
 		}
@@ -147,14 +177,34 @@ func (model dashboardModel) waitForTunnels() tea.Cmd {
 	}
 }
 
+func (model dashboardModel) waitForProbeTunnels() tea.Cmd {
+	return func() tea.Msg {
+		result, ok := <-model.probeTunnelResults
+		if !ok {
+			return nil
+		}
+		return probeTunnelStoppedMsg{index: result.index, err: result.err}
+	}
+}
+
 func (model *dashboardModel) updateStatuses(results probeResultsMsg) {
 	for _, result := range results {
+		if model.mappings[result.index].status == statusUnknown {
+			continue
+		}
 		if result.err == nil {
 			model.mappings[result.index].status = statusOpen
 			continue
 		}
 		model.mappings[result.index].status = statusWaiting
 	}
+}
+
+func (model *dashboardModel) recordProbeFailure(message probeTunnelStoppedMsg) {
+	if message.err == nil || errors.Is(message.err, context.Canceled) || model.probeFailure != nil {
+		return
+	}
+	model.probeFailure = fmt.Errorf("probe tunnel %s: %w", model.mappings[message.index].mapping, message.err)
 }
 
 func nextProbe() tea.Cmd {
@@ -200,6 +250,10 @@ func (harness commandHarness) runDashboard(
 ) error {
 	tunnelContext, cancel := context.WithCancel(ctx)
 	defer cancel()
+	probeMappings, err := harness.allocateProbeMappings()
+	if err != nil {
+		return err
+	}
 
 	tunnelResults := make(chan error, 1)
 	tunnelsDone := make(chan struct{})
@@ -207,9 +261,17 @@ func (harness commandHarness) runDashboard(
 		tunnelResults <- harness.startTunnels(tunnelContext)
 		close(tunnelsDone)
 	}()
+	probeTunnelResults, probeTunnelsDone := harness.startProbeTunnels(tunnelContext, probeMappings)
 
 	program := tea.NewProgram(
-		newDashboard(tunnelContext, harness.mappings, tunnelResults, probeTCP),
+		newDashboard(dashboardConfig{
+			ctx:                tunnelContext,
+			mappings:           harness.mappings,
+			probeMappings:      probeMappings,
+			tunnelResults:      tunnelResults,
+			probeTunnelResults: probeTunnelResults,
+			probe:              probeTCP,
+		}),
 		tea.WithContext(tunnelContext),
 		tea.WithInput(input),
 		tea.WithOutput(output),
@@ -218,10 +280,68 @@ func (harness commandHarness) runDashboard(
 	model, err := program.Run()
 	cancel()
 	<-tunnelsDone
+	<-probeTunnelsDone
 	if err != nil {
 		return err
 	}
-	return model.(dashboardModel).failure
+	failure := model.(dashboardModel).failure
+	if failure == nil {
+		return nil
+	}
+	return dashboardError{err: failure}
+}
+
+func (harness commandHarness) allocateProbeMappings() (portMappings, error) {
+	occupiedPorts := make(set[uint16], len(harness.mappings)*2)
+	for _, mapping := range harness.mappings {
+		occupiedPorts.add(mapping.localPort)
+	}
+
+	probeMappings := make(portMappings, len(harness.mappings))
+	for index, mapping := range harness.mappings {
+		port, err := allocateProbePort(occupiedPorts)
+		if err != nil {
+			return nil, err
+		}
+		probeMappings[index] = portMapping{localPort: port, workstationPort: mapping.workstationPort}
+	}
+	return probeMappings, nil
+}
+
+func allocateProbePort(occupiedPorts set[uint16]) (uint16, error) {
+	for {
+		listener, err := net.Listen("tcp", "localhost:0")
+		if err != nil {
+			return 0, err
+		}
+		port := uint16(listener.Addr().(*net.TCPAddr).Port)
+		if err := listener.Close(); err != nil {
+			return 0, err
+		}
+		if occupiedPorts.add(port) {
+			return port, nil
+		}
+	}
+}
+
+func (harness commandHarness) startProbeTunnels(
+	ctx context.Context,
+	mappings portMappings,
+) (<-chan probeTunnelResult, <-chan struct{}) {
+	results := make(chan probeTunnelResult, len(mappings))
+	done := make(chan struct{})
+	var group sync.WaitGroup
+	for index, mapping := range mappings {
+		group.Go(func() {
+			results <- probeTunnelResult{index: index, err: harness.tunnel(ctx, mapping)}
+		})
+	}
+	go func() {
+		group.Wait()
+		close(results)
+		close(done)
+	}()
+	return results, done
 }
 
 var (
@@ -239,6 +359,8 @@ func statusStyle(status tunnelStatus) lipgloss.Style {
 		return openStyle
 	case statusStopped:
 		return stopStyle
+	case statusUnknown:
+		return errorStyle
 	default:
 		return waitStyle
 	}

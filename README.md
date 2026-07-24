@@ -42,14 +42,16 @@ Local ports and workstation ports must each be unique.
 
 ## Status
 
-The dashboard checks every published local port every two seconds.
+The dashboard checks every published mapping every two seconds through a separate hidden tunnel.
+The hidden tunnel maps an ephemeral local port to the same workstation port and is never used for your traffic.
 
 - `STARTING`: The tunnel process has started but the first check has not completed.
-- `OPEN`: The tunnel returned data or stayed connected for the one-second TCP check.
-- `WAITING`: The local port refused the check or the tunnel closed it immediately.
+- `OPEN`: The hidden probe tunnel returned data or stayed connected for the one-second TCP check.
+- `WAITING`: The hidden probe tunnel refused the check or closed it immediately.
+- `UNKNOWN`: The hidden probe tunnel exited, so the workstation port cannot be checked safely.
 - `STOPPED`: The tunnel command exited.
 
-The TCP check exercises the forwarding path and detects immediate upstream connection closure.
+The TCP check exercises the forwarding path and detects immediate upstream connection closure without connecting through your visible local port.
 It does not verify application-level health, such as an HTTP response or database protocol handshake.
 
 Press `q` or `Ctrl+C` to stop all tunnels.
