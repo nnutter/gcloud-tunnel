@@ -11,11 +11,15 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// Version is set via ldflags at build time (e.g. Homebrew, GoReleaser).
+var Version string
+
 func main() {
 	command := newCommand()
 	err := fang.Execute(
 		context.Background(),
 		command,
+		fang.WithVersion(Version),
 		fang.WithColorSchemeFunc(tunnelColorScheme),
 		fang.WithErrorHandler(renderError),
 		fang.WithNotifySignal(os.Interrupt, syscall.SIGTERM),
