@@ -345,7 +345,7 @@ func (harness commandHarness) startProbeTunnels(
 }
 
 var (
-	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#5B21B6"))
+	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#3B82F6"))
 	dimStyle   = lipgloss.NewStyle().Foreground(lipgloss.BrightBlack)
 	errorStyle = lipgloss.NewStyle().Foreground(lipgloss.Red)
 	openStyle  = lipgloss.NewStyle().Foreground(lipgloss.Green)
