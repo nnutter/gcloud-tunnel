@@ -47,7 +47,9 @@ The hidden tunnel maps an ephemeral local port to the same workstation port and 
 
 - `STARTING`: The tunnel process has started but the first check has not completed.
 - `OPEN`: The hidden probe tunnel returned data or stayed connected for the one-second TCP check.
-- `WAITING`: The hidden probe tunnel refused the check or closed it immediately.
+- `WAITING`: The hidden probe tunnel refused the check or closed it immediately. After three
+  consecutive failed checks for a tunnel that was previously open, all tunnels restart
+  automatically to recover from stale connections after sleep or a network change.
 - `UNKNOWN`: The hidden probe tunnel exited, so the workstation port cannot be checked safely.
 - `STOPPED`: The tunnel command exited.
 

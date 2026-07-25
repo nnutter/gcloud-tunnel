@@ -28,29 +28,172 @@ func TestDashboardUpdatesProbeStatuses(t *testing.T) {
 		{localPort: 5432, workstationPort: 5432},
 	}, probeTCP)
 
-	updated, _ := model.Update(probeResultsMsg{
-		{index: 0},
-		{index: 1, err: errors.New("connection refused")},
-	})
+	updated, _ := model.Update(testProbeResults(
+		probeResult{index: 0},
+		probeResult{index: 1, err: errors.New("connection refused")},
+	))
 
 	assert.Equal(t, []mappingStatus{
 		{
-			mapping: portMapping{localPort: 8080, workstationPort: 80},
-			probe:   portMapping{localPort: 8080, workstationPort: 80},
-			status:  statusOpen,
+			mapping:     portMapping{localPort: 8080, workstationPort: 80},
+			probe:       portMapping{localPort: 8080, workstationPort: 80},
+			status:      statusOpen,
+			hasBeenOpen: true,
 		},
 		{
-			mapping: portMapping{localPort: 5432, workstationPort: 5432},
-			probe:   portMapping{localPort: 5432, workstationPort: 5432},
-			status:  statusWaiting,
+			mapping:                  portMapping{localPort: 5432, workstationPort: 5432},
+			probe:                    portMapping{localPort: 5432, workstationPort: 5432},
+			status:                   statusWaiting,
+			consecutiveProbeFailures: 1,
 		},
 	}, updated.(dashboardModel).mappings)
+}
+
+func TestDashboardRestartsTunnelsAfterThreeFailedProbes(t *testing.T) {
+	restartRequests := make(chan struct{}, 1)
+	model := newDashboard(dashboardConfig{
+		ctx:             t.Context(),
+		mappings:        portMappings{{localPort: 8080, workstationPort: 80}},
+		probeMappings:   portMappings{{localPort: 50000, workstationPort: 80}},
+		probe:           probeTCP,
+		restartRequests: restartRequests,
+	})
+
+	model.updateStatuses(testProbeResults(probeResult{index: 0}))
+	for range failedProbesBeforeRestart {
+		model.updateStatuses(testProbeResults(probeResult{index: 0, err: errors.New("connection refused")}))
+	}
+
+	assert.Equal(t, statusStarting, model.mappings[0].status)
+	assert.Equal(t, 0, model.mappings[0].consecutiveProbeFailures)
+	assert.Len(t, restartRequests, 1)
+}
+
+func TestDashboardDoesNotRestartBeforeTunnelHasOpened(t *testing.T) {
+	restartRequests := make(chan struct{}, 1)
+	model := newDashboard(dashboardConfig{
+		ctx:             t.Context(),
+		mappings:        portMappings{{localPort: 8080, workstationPort: 80}},
+		probeMappings:   portMappings{{localPort: 50000, workstationPort: 80}},
+		probe:           probeTCP,
+		restartRequests: restartRequests,
+	})
+
+	for range failedProbesBeforeRestart {
+		model.updateStatuses(testProbeResults(probeResult{index: 0, err: errors.New("connection refused")}))
+	}
+
+	assert.Equal(t, statusWaiting, model.mappings[0].status)
+	assert.Empty(t, restartRequests)
+}
+
+func TestDashboardSuccessfulProbeRearmsTunnelRestart(t *testing.T) {
+	restartRequests := make(chan struct{}, 1)
+	model := newDashboard(dashboardConfig{
+		ctx:             t.Context(),
+		mappings:        portMappings{{localPort: 8080, workstationPort: 80}},
+		probeMappings:   portMappings{{localPort: 50000, workstationPort: 80}},
+		probe:           probeTCP,
+		restartRequests: restartRequests,
+	})
+
+	model.updateStatuses(testProbeResults(probeResult{index: 0}))
+	for range failedProbesBeforeRestart - 1 {
+		model.updateStatuses(testProbeResults(probeResult{index: 0, err: errors.New("connection refused")}))
+	}
+	model.updateStatuses(testProbeResults(probeResult{index: 0}))
+	for range failedProbesBeforeRestart {
+		model.updateStatuses(testProbeResults(probeResult{index: 0, err: errors.New("connection refused")}))
+	}
+
+	assert.Len(t, restartRequests, 1)
+}
+
+func TestDashboardDoesNotRestartReplacementBeforeItHasOpened(t *testing.T) {
+	restartRequests := make(chan struct{}, 2)
+	model := newDashboard(dashboardConfig{
+		ctx:             t.Context(),
+		mappings:        portMappings{{localPort: 8080, workstationPort: 80}},
+		probeMappings:   portMappings{{localPort: 50000, workstationPort: 80}},
+		probe:           probeTCP,
+		restartRequests: restartRequests,
+	})
+
+	model.updateStatuses(testProbeResults(probeResult{index: 0}))
+	for range failedProbesBeforeRestart {
+		model.updateStatuses(testProbeResults(probeResult{index: 0, err: errors.New("connection refused")}))
+	}
+	updated, _ := model.Update(tunnelsRestartedMsg{generation: 1})
+	model = updated.(dashboardModel)
+	for range failedProbesBeforeRestart {
+		model.updateStatuses(testProbeResultsForGeneration(1, probeResult{index: 0, err: errors.New("connection refused")}))
+	}
+
+	assert.Len(t, restartRequests, 1)
+	assert.Equal(t, statusWaiting, model.mappings[0].status)
+}
+
+func TestDashboardDiscardsRemainingProbeResultsAfterRequestingRestart(t *testing.T) {
+	restartRequests := make(chan struct{}, 1)
+	model := newDashboard(dashboardConfig{
+		ctx: t.Context(),
+		mappings: portMappings{
+			{localPort: 8080, workstationPort: 80},
+			{localPort: 5432, workstationPort: 5432},
+		},
+		probeMappings: portMappings{
+			{localPort: 50000, workstationPort: 80},
+			{localPort: 50001, workstationPort: 5432},
+		},
+		probe:           probeTCP,
+		restartRequests: restartRequests,
+	})
+	model.mappings[0].hasBeenOpen = true
+	model.mappings[0].consecutiveProbeFailures = failedProbesBeforeRestart - 1
+
+	model.updateStatuses(testProbeResults(
+		probeResult{index: 0, err: errors.New("connection refused")},
+		probeResult{index: 1},
+	))
+
+	assert.Equal(t, statusStarting, model.mappings[1].status)
+	assert.False(t, model.mappings[1].hasBeenOpen)
+}
+
+func TestDashboardDiscardsProbeTunnelExitFromPreviousGeneration(t *testing.T) {
+	model := newTestDashboard(t, portMappings{{localPort: 8080, workstationPort: 80}}, probeTCP)
+	model.generation = 1
+
+	updated, _ := model.Update(probeTunnelStoppedMsg{
+		index:      0,
+		generation: 0,
+		err:        errors.New("previous generation stopped"),
+	})
+
+	assert.Equal(t, statusStarting, updated.(dashboardModel).mappings[0].status)
+	assert.NoError(t, updated.(dashboardModel).probeFailure)
+}
+
+func TestDashboardClearsProbeFailureWhenRestarting(t *testing.T) {
+	restartRequests := make(chan struct{}, 1)
+	model := newDashboard(dashboardConfig{
+		ctx:             t.Context(),
+		mappings:        portMappings{{localPort: 8080, workstationPort: 80}},
+		probeMappings:   portMappings{{localPort: 50000, workstationPort: 80}},
+		probe:           probeTCP,
+		restartRequests: restartRequests,
+	})
+	model.probeFailure = errors.New("stale probe failure")
+
+	model.requestRestart()
+
+	assert.NoError(t, model.probeFailure)
 }
 
 func TestDashboardSchedulesNextProbeAfterResults(t *testing.T) {
 	model := newTestDashboard(t, portMappings{{localPort: 8080, workstationPort: 80}}, probeTCP)
 
-	_, command := model.Update(probeResultsMsg{{index: 0}})
+	_, command := model.Update(testProbeResults(probeResult{index: 0}))
 
 	assert.NotNil(t, command)
 }
@@ -101,7 +244,7 @@ func TestDashboardPreservesUnknownStatusAfterProbeTunnelStops(t *testing.T) {
 	model := newTestDashboard(t, portMappings{{localPort: 8080, workstationPort: 80}}, probeTCP)
 	model.mappings[0].status = statusUnknown
 
-	updated, _ := model.Update(probeResultsMsg{{index: 0}})
+	updated, _ := model.Update(testProbeResults(probeResult{index: 0}))
 
 	assert.Equal(t, statusUnknown, updated.(dashboardModel).mappings[0].status)
 }
@@ -159,6 +302,38 @@ func TestProbeTunnelFailureDoesNotCancelPrimaryTunnel(t *testing.T) {
 	cancel()
 	require.Error(t, <-primaryResults)
 	<-probeDone
+}
+
+func TestTunnelSupervisorRestartsTunnelGeneration(t *testing.T) {
+	started := make(chan uint16, 4)
+	rootContext, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	harness := commandHarness{
+		mappings: portMappings{{localPort: 8080, workstationPort: 80}},
+		run: func(ctx context.Context, _ string, arguments ...string) error {
+			localPort := uint16(8080)
+			if arguments[4] == "--local-host-port=localhost:50000" {
+				localPort = 50000
+			}
+			started <- localPort
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+	restartRequests := make(chan struct{}, 1)
+	tunnelResults, _, restartResults, done := harness.superviseTunnels(
+		rootContext,
+		portMappings{{localPort: 50000, workstationPort: 80}},
+		restartRequests,
+	)
+
+	assert.ElementsMatch(t, []uint16{8080, 50000}, []uint16{<-started, <-started})
+	restartRequests <- struct{}{}
+	assert.ElementsMatch(t, []uint16{8080, 50000}, []uint16{<-started, <-started})
+	assert.Equal(t, 1, <-restartResults)
+	assert.Empty(t, tunnelResults)
+	cancel()
+	<-done
 }
 
 func TestProbeTCPConnectsToOpenLocalPort(t *testing.T) {
@@ -253,4 +428,12 @@ func newTestDashboard(t *testing.T, mappings portMappings, probe portProbe) dash
 		probeMappings: mappings,
 		probe:         probe,
 	})
+}
+
+func testProbeResults(results ...probeResult) probeResultsMsg {
+	return testProbeResultsForGeneration(0, results...)
+}
+
+func testProbeResultsForGeneration(generation int, results ...probeResult) probeResultsMsg {
+	return probeResultsMsg{generation: generation, results: results}
 }

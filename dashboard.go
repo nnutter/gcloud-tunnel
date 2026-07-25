@@ -19,6 +19,7 @@ import (
 
 const probeInterval = 2 * time.Second
 const probeTimeout = time.Second
+const failedProbesBeforeRestart = 3
 
 type tunnelStatus string
 
@@ -31,9 +32,11 @@ const (
 )
 
 type mappingStatus struct {
-	mapping portMapping
-	probe   portMapping
-	status  tunnelStatus
+	mapping                  portMapping
+	probe                    portMapping
+	status                   tunnelStatus
+	consecutiveProbeFailures int
+	hasBeenOpen              bool
 }
 
 type portProbe func(context.Context, portMapping) error
@@ -43,7 +46,10 @@ type probeResult struct {
 	err   error
 }
 
-type probeResultsMsg []probeResult
+type probeResultsMsg struct {
+	generation int
+	results    []probeResult
+}
 
 type probeTickMsg struct{}
 
@@ -51,14 +57,20 @@ type tunnelsStoppedMsg struct {
 	err error
 }
 
+type tunnelsRestartedMsg struct {
+	generation int
+}
+
 type probeTunnelResult struct {
-	index int
-	err   error
+	index      int
+	generation int
+	err        error
 }
 
 type probeTunnelStoppedMsg struct {
-	index int
-	err   error
+	index      int
+	generation int
+	err        error
 }
 
 type dashboardConfig struct {
@@ -67,6 +79,8 @@ type dashboardConfig struct {
 	probeMappings      portMappings
 	tunnelResults      <-chan error
 	probeTunnelResults <-chan probeTunnelResult
+	restartRequests    chan<- struct{}
+	restartResults     <-chan int
 	probe              portProbe
 }
 
@@ -76,9 +90,23 @@ type dashboardModel struct {
 	probe              portProbe
 	tunnelResults      <-chan error
 	probeTunnelResults <-chan probeTunnelResult
+	restartRequests    chan<- struct{}
+	restartResults     <-chan int
 	failure            error
 	probeFailure       error
 	stopped            bool
+	restartPending     bool
+	generation         int
+}
+
+type tunnelSupervisor struct {
+	harness            commandHarness
+	ctx                context.Context
+	probeMappings      portMappings
+	restartRequests    <-chan struct{}
+	restartResults     chan<- int
+	tunnelResults      chan<- error
+	probeTunnelResults chan<- probeTunnelResult
 }
 
 func newDashboard(config dashboardConfig) dashboardModel {
@@ -96,11 +124,18 @@ func newDashboard(config dashboardConfig) dashboardModel {
 		probe:              config.probe,
 		tunnelResults:      config.tunnelResults,
 		probeTunnelResults: config.probeTunnelResults,
+		restartRequests:    config.restartRequests,
+		restartResults:     config.restartResults,
 	}
 }
 
 func (model dashboardModel) Init() tea.Cmd {
-	return tea.Batch(model.probeMappings(), model.waitForTunnels(), model.waitForProbeTunnels())
+	return tea.Batch(
+		model.probeMappings(),
+		model.waitForTunnels(),
+		model.waitForProbeTunnels(),
+		model.waitForTunnelRestart(),
+	)
 }
 
 func (model dashboardModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
@@ -121,7 +156,17 @@ func (model dashboardModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			model.mappings[index].status = statusStopped
 		}
 		return model, tea.Quit
+	case tunnelsRestartedMsg:
+		model.restartPending = false
+		model.generation = message.generation
+		return model, model.waitForTunnelRestart()
 	case probeTunnelStoppedMsg:
+		if message.generation != model.generation {
+			return model, model.waitForProbeTunnels()
+		}
+		if model.restartPending {
+			return model, model.waitForProbeTunnels()
+		}
 		model.mappings[message.index].status = statusUnknown
 		model.recordProbeFailure(message)
 		return model, model.waitForProbeTunnels()
@@ -157,8 +202,9 @@ func (model dashboardModel) View() tea.View {
 
 func (model dashboardModel) probeMappings() tea.Cmd {
 	mappings := slices.Clone(model.mappings)
+	generation := model.generation
 	return func() tea.Msg {
-		results := make(probeResultsMsg, len(mappings))
+		results := make([]probeResult, len(mappings))
 		var group errgroup.Group
 		for index, mapping := range mappings {
 			group.Go(func() error {
@@ -167,7 +213,7 @@ func (model dashboardModel) probeMappings() tea.Cmd {
 			})
 		}
 		_ = group.Wait()
-		return results
+		return probeResultsMsg{generation: generation, results: results}
 	}
 }
 
@@ -183,20 +229,58 @@ func (model dashboardModel) waitForProbeTunnels() tea.Cmd {
 		if !ok {
 			return nil
 		}
-		return probeTunnelStoppedMsg{index: result.index, err: result.err}
+		return probeTunnelStoppedMsg{index: result.index, generation: result.generation, err: result.err}
 	}
 }
 
 func (model *dashboardModel) updateStatuses(results probeResultsMsg) {
-	for _, result := range results {
-		if model.mappings[result.index].status == statusUnknown {
+	if model.restartPending || results.generation != model.generation {
+		return
+	}
+	for _, result := range results.results {
+		mapping := &model.mappings[result.index]
+		if mapping.status == statusUnknown {
 			continue
 		}
 		if result.err == nil {
-			model.mappings[result.index].status = statusOpen
+			mapping.status = statusOpen
+			mapping.hasBeenOpen = true
+			mapping.consecutiveProbeFailures = 0
 			continue
 		}
-		model.mappings[result.index].status = statusWaiting
+		mapping.status = statusWaiting
+		mapping.consecutiveProbeFailures++
+		if mapping.hasBeenOpen && mapping.consecutiveProbeFailures >= failedProbesBeforeRestart {
+			model.requestRestart()
+			return
+		}
+	}
+}
+
+func (model *dashboardModel) requestRestart() {
+	if model.restartPending {
+		return
+	}
+	model.restartPending = true
+	for index := range model.mappings {
+		model.mappings[index].status = statusStarting
+		model.mappings[index].consecutiveProbeFailures = 0
+		model.mappings[index].hasBeenOpen = false
+	}
+	model.probeFailure = nil
+	select {
+	case model.restartRequests <- struct{}{}:
+	default:
+	}
+}
+
+func (model dashboardModel) waitForTunnelRestart() tea.Cmd {
+	return func() tea.Msg {
+		generation, ok := <-model.restartResults
+		if !ok {
+			return nil
+		}
+		return tunnelsRestartedMsg{generation: generation}
 	}
 }
 
@@ -255,13 +339,12 @@ func (harness commandHarness) runDashboard(
 		return err
 	}
 
-	tunnelResults := make(chan error, 1)
-	tunnelsDone := make(chan struct{})
-	go func() {
-		tunnelResults <- harness.startTunnels(tunnelContext)
-		close(tunnelsDone)
-	}()
-	probeTunnelResults, probeTunnelsDone := harness.startProbeTunnels(tunnelContext, probeMappings)
+	restartRequests := make(chan struct{}, 1)
+	tunnelResults, probeTunnelResults, restartResults, tunnelsDone := harness.superviseTunnels(
+		tunnelContext,
+		probeMappings,
+		restartRequests,
+	)
 
 	program := tea.NewProgram(
 		newDashboard(dashboardConfig{
@@ -270,6 +353,8 @@ func (harness commandHarness) runDashboard(
 			probeMappings:      probeMappings,
 			tunnelResults:      tunnelResults,
 			probeTunnelResults: probeTunnelResults,
+			restartRequests:    restartRequests,
+			restartResults:     restartResults,
 			probe:              probeTCP,
 		}),
 		tea.WithContext(tunnelContext),
@@ -280,7 +365,6 @@ func (harness commandHarness) runDashboard(
 	model, err := program.Run()
 	cancel()
 	<-tunnelsDone
-	<-probeTunnelsDone
 	if err != nil {
 		return err
 	}
@@ -289,6 +373,91 @@ func (harness commandHarness) runDashboard(
 		return nil
 	}
 	return dashboardError{err: failure}
+}
+
+func (harness commandHarness) superviseTunnels(
+	ctx context.Context,
+	probeMappings portMappings,
+	restartRequests <-chan struct{},
+) (<-chan error, <-chan probeTunnelResult, <-chan int, <-chan struct{}) {
+	tunnelResults := make(chan error, 1)
+	probeTunnelResults := make(chan probeTunnelResult, len(probeMappings))
+	restartResults := make(chan int, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer close(probeTunnelResults)
+		defer close(restartResults)
+		supervisor := tunnelSupervisor{
+			harness:            harness,
+			ctx:                ctx,
+			probeMappings:      probeMappings,
+			restartRequests:    restartRequests,
+			restartResults:     restartResults,
+			tunnelResults:      tunnelResults,
+			probeTunnelResults: probeTunnelResults,
+		}
+		supervisor.run()
+	}()
+	return tunnelResults, probeTunnelResults, restartResults, done
+}
+
+func (supervisor tunnelSupervisor) run() {
+	for generation := 0; supervisor.ctx.Err() == nil && supervisor.superviseGeneration(generation); generation++ {
+	}
+}
+
+func (supervisor tunnelSupervisor) superviseGeneration(generation int) bool {
+	generationContext, cancel := context.WithCancel(supervisor.ctx)
+	defer cancel()
+	primaryResults, primaryDone := supervisor.harness.startTunnelGeneration(generationContext)
+	probeResults, probesDone := supervisor.harness.startProbeTunnels(generationContext, supervisor.probeMappings)
+	for primaryResults != nil || probeResults != nil {
+		select {
+		case err := <-primaryResults:
+			if supervisor.ctx.Err() != nil {
+				<-probesDone
+				return false
+			}
+			cancel()
+			supervisor.tunnelResults <- err
+			<-primaryDone
+			<-probesDone
+			return false
+		case result, ok := <-probeResults:
+			if !ok {
+				probeResults = nil
+				continue
+			}
+			result.generation = generation
+			supervisor.probeTunnelResults <- result
+		case <-supervisor.restartRequests:
+			cancel()
+			<-primaryDone
+			<-probesDone
+			if supervisor.ctx.Err() != nil {
+				return false
+			}
+			supervisor.restartResults <- generation + 1
+			return true
+		case <-supervisor.ctx.Done():
+			<-primaryDone
+			<-probesDone
+			return false
+		}
+	}
+	<-primaryDone
+	return false
+}
+
+func (harness commandHarness) startTunnelGeneration(ctx context.Context) (<-chan error, <-chan struct{}) {
+	results := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		results <- harness.startTunnels(ctx)
+		close(done)
+	}()
+	return results, done
 }
 
 func (harness commandHarness) allocateProbeMappings() (portMappings, error) {
