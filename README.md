@@ -43,7 +43,12 @@ Local ports and workstation ports must each be unique.
 ## Status
 
 The dashboard checks every published mapping every two seconds through a separate hidden tunnel.
+Failed checks back off up to thirty seconds and include a small random delay to avoid synchronized retries.
 The hidden tunnel maps an ephemeral local port to the same workstation port and is never used for your traffic.
+SSH services are probed with a short identification exchange followed by an explicit disconnect so
+pre-authentication connections do not remain open waiting for the SSH login grace period.
+Eternal Terminal services on workstation port 2022 receive a minimal handshake and expected rejection
+so pre-authentication connections do not remain open waiting for the Eternal Terminal handshake.
 
 - `STARTING`: The tunnel process has started but the first check has not completed.
 - `OPEN`: The hidden probe tunnel returned data or stayed connected for the one-second TCP check.
@@ -55,5 +60,6 @@ The hidden tunnel maps an ephemeral local port to the same workstation port and 
 
 The TCP check exercises the forwarding path and detects immediate upstream connection closure without connecting through your visible local port.
 It does not verify application-level health, such as an HTTP response or database protocol handshake.
+For SSH services, configure the server's `LoginGraceTime` conservatively as an additional safeguard against incomplete pre-authentication connections.
 
 Press `q` or `Ctrl+C` to stop all tunnels.

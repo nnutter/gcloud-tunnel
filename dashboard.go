@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"slices"
 	"strconv"
@@ -17,9 +20,14 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-const probeInterval = 2 * time.Second
-const probeTimeout = time.Second
-const failedProbesBeforeRestart = 3
+const (
+	probeInterval             = 2 * time.Second
+	probeTimeout              = time.Second
+	failedProbesBeforeRestart = 3
+	maxProbeInterval          = 30 * time.Second
+	probeJitter               = 250 * time.Millisecond
+	restartCooldown           = time.Second
+)
 
 type tunnelStatus string
 
@@ -97,6 +105,7 @@ type dashboardModel struct {
 	stopped            bool
 	restartPending     bool
 	generation         int
+	probeBackoff       int
 }
 
 type tunnelSupervisor struct {
@@ -146,7 +155,7 @@ func (model dashboardModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case probeResultsMsg:
 		model.updateStatuses(message)
-		return model, nextProbe()
+		return model, model.nextProbe()
 	case probeTickMsg:
 		return model, model.probeMappings()
 	case tunnelsStoppedMsg:
@@ -237,6 +246,7 @@ func (model *dashboardModel) updateStatuses(results probeResultsMsg) {
 	if model.restartPending || results.generation != model.generation {
 		return
 	}
+	maxProbeFailures := 0
 	for _, result := range results.results {
 		mapping := &model.mappings[result.index]
 		if mapping.status == statusUnknown {
@@ -250,11 +260,15 @@ func (model *dashboardModel) updateStatuses(results probeResultsMsg) {
 		}
 		mapping.status = statusWaiting
 		mapping.consecutiveProbeFailures++
+		if mapping.consecutiveProbeFailures > maxProbeFailures {
+			maxProbeFailures = mapping.consecutiveProbeFailures
+		}
 		if mapping.hasBeenOpen && mapping.consecutiveProbeFailures >= failedProbesBeforeRestart {
 			model.requestRestart()
 			return
 		}
 	}
+	model.probeBackoff = maxProbeFailures
 }
 
 func (model *dashboardModel) requestRestart() {
@@ -268,6 +282,7 @@ func (model *dashboardModel) requestRestart() {
 		model.mappings[index].hasBeenOpen = false
 	}
 	model.probeFailure = nil
+	model.probeBackoff = 0
 	select {
 	case model.restartRequests <- struct{}{}:
 	default:
@@ -291,8 +306,21 @@ func (model *dashboardModel) recordProbeFailure(message probeTunnelStoppedMsg) {
 	model.probeFailure = fmt.Errorf("probe tunnel %s: %w", model.mappings[message.index].mapping, message.err)
 }
 
-func nextProbe() tea.Cmd {
-	return tea.Tick(probeInterval, func(time.Time) tea.Msg {
+func (model dashboardModel) nextProbe() tea.Cmd {
+	delay := probeInterval
+	for range model.probeBackoff {
+		delay *= 2
+		if delay >= maxProbeInterval {
+			delay = maxProbeInterval
+			break
+		}
+	}
+	jitter := time.Duration(rand.Int63n(int64(2*probeJitter)+1)) - probeJitter
+	delay += jitter
+	if delay > maxProbeInterval {
+		delay = maxProbeInterval
+	}
+	return tea.Tick(delay, func(time.Time) tea.Msg {
 		return probeTickMsg{}
 	})
 }
@@ -300,6 +328,21 @@ func nextProbe() tea.Cmd {
 func probeTCP(ctx context.Context, mapping portMapping) error {
 	return probeTCPWithTimeout(ctx, mapping, probeTimeout)
 }
+
+const (
+	sshPort                    = 22
+	sshClientIdentification    = "SSH-2.0-gcloud-tunnel-probe\r\n"
+	sshIdentificationPrefix    = "SSH-"
+	sshMaxIdentificationSize   = 255
+	sshMsgDisconnect           = 1
+	sshDisconnectByApplication = 11
+
+	eternalTerminalPort             = 2022
+	eternalTerminalProtocolVersion  = 6
+	eternalTerminalStatusInvalidKey = 3
+	eternalTerminalStatusMismatched = 4
+	eternalTerminalMaxResponseSize  = 4 * 1024
+)
 
 func probeTCPWithTimeout(ctx context.Context, mapping portMapping, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
@@ -312,19 +355,227 @@ func probeTCPWithTimeout(ctx context.Context, mapping portMapping, timeout time.
 		return err
 	}
 	defer connection.Close()
+
+	switch mapping.workstationPort {
+	case sshPort:
+		if err := writeSSHClientIdentification(connection, deadline); err != nil {
+			return err
+		}
+		return probeServerResponse(connection, deadline)
+	case eternalTerminalPort:
+		return probeEternalTerminal(connection, deadline)
+	default:
+		return probeServerResponse(connection, deadline)
+	}
+}
+
+func probeServerResponse(connection net.Conn, deadline time.Time) error {
 	if err := connection.SetReadDeadline(deadline); err != nil {
 		return err
 	}
 
-	var response [1]byte
-	count, err := connection.Read(response[:])
-	if count > 0 {
+	var firstByte [1]byte
+	count, err := connection.Read(firstByte[:])
+	if count == 0 {
+		if networkError, ok := errors.AsType[net.Error](err); ok && networkError.Timeout() {
+			return nil
+		}
+		return err
+	}
+	if firstByte[0] != sshIdentificationPrefix[0] {
 		return nil
 	}
-	if networkError, ok := errors.AsType[net.Error](err); ok && networkError.Timeout() {
+
+	var remainingPrefix [len(sshIdentificationPrefix) - 1]byte
+	count, err = io.ReadFull(connection, remainingPrefix[:])
+	if count < len(remainingPrefix) {
 		return nil
 	}
-	return err
+	if err != nil || string(append([]byte{firstByte[0]}, remainingPrefix[:]...)) != sshIdentificationPrefix {
+		return nil
+	}
+
+	identification := append([]byte(sshIdentificationPrefix), remainingPrefix[:]...)
+	for len(identification) < sshMaxIdentificationSize {
+		var nextByte [1]byte
+		count, err := connection.Read(nextByte[:])
+		if count > 0 {
+			identification = append(identification, nextByte[0])
+			if nextByte[0] == '\n' {
+				break
+			}
+		}
+		if err != nil {
+			if networkError, ok := errors.AsType[net.Error](err); ok && networkError.Timeout() {
+				return nil
+			}
+			return err
+		}
+	}
+	if identification[len(identification)-1] != '\n' {
+		return nil
+	}
+
+	return sendSSHProbeDisconnect(connection, deadline)
+}
+
+func writeProbeBytes(connection net.Conn, data []byte, deadline time.Time) error {
+	if err := connection.SetWriteDeadline(deadline); err != nil {
+		return err
+	}
+	for len(data) > 0 {
+		count, err := connection.Write(data)
+		if count > 0 {
+			data = data[count:]
+		}
+		if err != nil {
+			return err
+		}
+		if count == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
+}
+
+func writeSSHClientIdentification(connection net.Conn, deadline time.Time) error {
+	return writeProbeBytes(connection, []byte(sshClientIdentification), deadline)
+}
+
+func sendSSHProbeDisconnect(connection net.Conn, deadline time.Time) error {
+	description := []byte("gcloud-tunnel probe")
+	payloadLength := 1 + 4 + 4 + len(description) + 4
+	paddingLength := 8 - ((1 + payloadLength) % 8)
+	if paddingLength < 4 {
+		paddingLength += 8
+	}
+	packetLength := 1 + payloadLength + paddingLength
+	packet := make([]byte, 4+packetLength)
+	binary.BigEndian.PutUint32(packet[:4], uint32(packetLength))
+	packet[4] = byte(paddingLength)
+
+	offset := 5
+	packet[offset] = sshMsgDisconnect
+	offset++
+	binary.BigEndian.PutUint32(packet[offset:offset+4], sshDisconnectByApplication)
+	offset += 4
+	binary.BigEndian.PutUint32(packet[offset:offset+4], uint32(len(description)))
+	offset += 4
+	offset += copy(packet[offset:], description)
+	binary.BigEndian.PutUint32(packet[offset:offset+4], 0)
+	offset += 4
+	if _, err := cryptorand.Read(packet[offset:]); err != nil {
+		return err
+	}
+
+	return writeProbeBytes(connection, packet, deadline)
+}
+
+func probeEternalTerminal(connection net.Conn, deadline time.Time) error {
+	// ET frames protobuf messages with a native-endian int64 length. An empty
+	// client ID is guaranteed not to match a real terminal session; using the
+	// current protocol version makes the server return INVALID_KEY instead of
+	// logging a protocol mismatch.
+	request := []byte{0x10, eternalTerminalProtocolVersion}
+	frame := make([]byte, 8+len(request))
+	binary.NativeEndian.PutUint64(frame[:8], uint64(len(request)))
+	copy(frame[8:], request)
+	if err := writeProbeBytes(connection, frame, deadline); err != nil {
+		return err
+	}
+
+	if err := connection.SetReadDeadline(deadline); err != nil {
+		return err
+	}
+	var responseLengthBytes [8]byte
+	if _, err := io.ReadFull(connection, responseLengthBytes[:]); err != nil {
+		if networkError, ok := errors.AsType[net.Error](err); ok && networkError.Timeout() {
+			return nil
+		}
+		return err
+	}
+	responseLength := binary.NativeEndian.Uint64(responseLengthBytes[:])
+	if responseLength > eternalTerminalMaxResponseSize {
+		return fmt.Errorf("Eternal Terminal response is too large: %d bytes", responseLength)
+	}
+	response := make([]byte, int(responseLength))
+	if _, err := io.ReadFull(connection, response); err != nil {
+		if networkError, ok := errors.AsType[net.Error](err); ok && networkError.Timeout() {
+			return nil
+		}
+		return err
+	}
+	status, ok := eternalTerminalResponseStatus(response)
+	if !ok {
+		return errors.New("invalid Eternal Terminal response")
+	}
+	if status != eternalTerminalStatusInvalidKey && status != eternalTerminalStatusMismatched {
+		return fmt.Errorf("unexpected Eternal Terminal response status: %d", status)
+	}
+	return nil
+}
+
+func eternalTerminalResponseStatus(response []byte) (uint64, bool) {
+	for offset := 0; offset < len(response); {
+		tag, count, ok := readProtoVarint(response[offset:])
+		if !ok || tag == 0 {
+			return 0, false
+		}
+		offset += count
+		fieldNumber := tag >> 3
+		wireType := tag & 7
+		switch wireType {
+		case 0:
+			value, count, ok := readProtoVarint(response[offset:])
+			if !ok {
+				return 0, false
+			}
+			offset += count
+			if fieldNumber == 1 {
+				return value, true
+			}
+		case 1:
+			if len(response)-offset < 8 {
+				return 0, false
+			}
+			offset += 8
+		case 2:
+			length, count, ok := readProtoVarint(response[offset:])
+			if !ok {
+				return 0, false
+			}
+			offset += count
+			if length > uint64(len(response)-offset) {
+				return 0, false
+			}
+			offset += int(length)
+		case 5:
+			if len(response)-offset < 4 {
+				return 0, false
+			}
+			offset += 4
+		default:
+			return 0, false
+		}
+	}
+	return 0, false
+}
+
+func readProtoVarint(data []byte) (uint64, int, bool) {
+	var value uint64
+	for index, byteValue := range data {
+		if index == 9 && byteValue > 1 {
+			return 0, 0, false
+		}
+		if index >= 10 {
+			return 0, 0, false
+		}
+		value |= uint64(byteValue&0x7f) << (7 * index)
+		if byteValue < 0x80 {
+			return value, index + 1, true
+		}
+	}
+	return 0, 0, false
 }
 
 func (harness commandHarness) runDashboard(
@@ -436,6 +687,13 @@ func (supervisor tunnelSupervisor) superviseGeneration(generation int) bool {
 			<-primaryDone
 			<-probesDone
 			if supervisor.ctx.Err() != nil {
+				return false
+			}
+			timer := time.NewTimer(restartCooldown)
+			select {
+			case <-timer.C:
+			case <-supervisor.ctx.Done():
+				timer.Stop()
 				return false
 			}
 			supervisor.restartResults <- generation + 1
