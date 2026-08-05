@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/binary"
 	"errors"
+	"io"
 	"net"
 	"strings"
 	"testing"
@@ -345,7 +348,7 @@ func TestProbeTCPConnectsToOpenLocalPort(t *testing.T) {
 	go func() {
 		connection, err := listener.Accept()
 		if err == nil {
-			_, err = connection.Write([]byte("SSH-2.0-test\r\n"))
+			_, err = connection.Write([]byte("OK"))
 			closeError := connection.Close()
 			if err == nil {
 				err = closeError
@@ -359,6 +362,93 @@ func TestProbeTCPConnectsToOpenLocalPort(t *testing.T) {
 
 	require.NoError(t, err)
 	require.NoError(t, <-accepted)
+}
+
+func TestProbeTCPDisconnectsFromSSHServer(t *testing.T) {
+	listener, err := net.Listen("tcp", "localhost:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, listener.Close()) })
+
+	request := make(chan []byte, 1)
+	serverErrors := make(chan error, 1)
+	go func() {
+		connection, err := listener.Accept()
+		if err == nil {
+			reader := bufio.NewReader(connection)
+			var clientIdentification string
+			clientIdentification, err = reader.ReadString('\n')
+			if err == nil {
+				if _, err = connection.Write([]byte("SSH-2.0-test\r\n")); err == nil {
+					var packet []byte
+					packet, err = io.ReadAll(reader)
+					request <- append([]byte(clientIdentification), packet...)
+				}
+			}
+			closeError := connection.Close()
+			if err == nil {
+				err = closeError
+			}
+		}
+		serverErrors <- err
+	}()
+
+	port := listener.Addr().(*net.TCPAddr).Port
+	err = probeTCP(t.Context(), portMapping{localPort: uint16(port), workstationPort: sshPort})
+
+	require.NoError(t, err)
+	require.NoError(t, <-serverErrors)
+	data := <-request
+	requestPrefixLength := len(sshClientIdentification)
+	require.GreaterOrEqual(t, len(data), requestPrefixLength+9)
+	assert.Equal(t, sshClientIdentification, string(data[:requestPrefixLength]))
+
+	packet := data[requestPrefixLength:]
+	packetLength := int(binary.BigEndian.Uint32(packet[:4]))
+	assert.Equal(t, len(packet)-4, packetLength)
+	assert.Equal(t, byte(sshMsgDisconnect), packet[5])
+}
+
+func TestProbeTCPDisconnectsFromEternalTerminalServer(t *testing.T) {
+	listener, err := net.Listen("tcp", "localhost:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, listener.Close()) })
+
+	request := make(chan []byte, 1)
+	serverErrors := make(chan error, 1)
+	go func() {
+		connection, err := listener.Accept()
+		if err == nil {
+			var lengthBytes [8]byte
+			_, err = io.ReadFull(connection, lengthBytes[:])
+			if err == nil {
+				length := binary.NativeEndian.Uint64(lengthBytes[:])
+				payload := make([]byte, int(length))
+				_, err = io.ReadFull(connection, payload)
+				if err == nil {
+					request <- append(lengthBytes[:], payload...)
+					response := []byte{0x08, eternalTerminalStatusInvalidKey}
+					frame := make([]byte, 8+len(response))
+					binary.NativeEndian.PutUint64(frame[:8], uint64(len(response)))
+					copy(frame[8:], response)
+					_, err = connection.Write(frame)
+				}
+			}
+			closeError := connection.Close()
+			if err == nil {
+				err = closeError
+			}
+		}
+		serverErrors <- err
+	}()
+
+	port := listener.Addr().(*net.TCPAddr).Port
+	err = probeTCP(t.Context(), portMapping{localPort: uint16(port), workstationPort: eternalTerminalPort})
+
+	require.NoError(t, err)
+	require.NoError(t, <-serverErrors)
+	data := <-request
+	assert.Equal(t, uint64(len(data)-8), binary.NativeEndian.Uint64(data[:8]))
+	assert.Equal(t, []byte{0x10, eternalTerminalProtocolVersion}, data[8:])
 }
 
 func TestProbeTCPAcceptsSilentOpenConnection(t *testing.T) {
