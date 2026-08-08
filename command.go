@@ -4,12 +4,15 @@ import (
 	"context"
 	"fmt"
 	"image/color"
+	"slices"
 	"strconv"
 
 	"charm.land/fang/v2"
 	"charm.land/lipgloss/v2"
 	"golang.org/x/sync/errgroup"
 )
+
+const lemonadePort uint16 = 2489
 
 type commandHarness struct {
 	account          string
@@ -18,6 +21,7 @@ type commandHarness struct {
 	config           string
 	region           string
 	startWorkstation bool
+	noLemonade       bool
 	workstation      string
 
 	mappings portMappings
@@ -26,9 +30,10 @@ type commandHarness struct {
 }
 
 func (harness commandHarness) validatePortMappings() error {
-	localPorts := make(set[uint16], len(harness.mappings))
-	workstationPorts := make(set[uint16], len(harness.mappings))
-	for _, mapping := range harness.mappings {
+	mappings := harness.tunnelMappings()
+	localPorts := make(set[uint16], len(mappings))
+	workstationPorts := make(set[uint16], len(mappings))
+	for _, mapping := range mappings {
 		if !localPorts.add(mapping.localPort) {
 			return fmt.Errorf("local port %d is published more than once", mapping.localPort)
 		}
@@ -39,12 +44,37 @@ func (harness commandHarness) validatePortMappings() error {
 	return nil
 }
 
+func (harness commandHarness) tunnelMappings() portMappings {
+	if harness.noLemonade || slices.Contains(harness.mappings, lemonadeMapping()) {
+		return harness.mappings
+	}
+	return append(slices.Clone(harness.mappings), lemonadeMapping())
+}
+
+func (harness commandHarness) monitoredMappings() portMappings {
+	if harness.noLemonade {
+		return harness.mappings
+	}
+	mappings := make(portMappings, 0, len(harness.mappings))
+	for _, mapping := range harness.mappings {
+		if mapping.localPort == lemonadePort || mapping.workstationPort == lemonadePort {
+			continue
+		}
+		mappings = append(mappings, mapping)
+	}
+	return mappings
+}
+
+func lemonadeMapping() portMapping {
+	return portMapping{localPort: lemonadePort, workstationPort: lemonadePort}
+}
+
 func (harness commandHarness) startTunnels(ctx context.Context) error {
 	if err := harness.validatePortMappings(); err != nil {
 		return err
 	}
 	group, groupContext := errgroup.WithContext(ctx)
-	for _, mapping := range harness.mappings {
+	for _, mapping := range harness.tunnelMappings() {
 		group.Go(func() error {
 			if err := harness.tunnel(groupContext, mapping); err != nil {
 				return fmt.Errorf("tunnel %s: %w", mapping, err)
@@ -53,6 +83,10 @@ func (harness commandHarness) startTunnels(ctx context.Context) error {
 		})
 	}
 	return group.Wait()
+}
+
+func (harness commandHarness) startLemonadeServer(ctx context.Context) error {
+	return harness.run(ctx, "lemonade", "server", "-allow", "127.0.0.1")
 }
 
 func (harness commandHarness) tunnel(ctx context.Context, mapping portMapping) error {

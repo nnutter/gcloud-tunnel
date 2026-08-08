@@ -141,6 +141,7 @@ func TestStartTunnelsRunsMappingsConcurrently(t *testing.T) {
 
 	go func() {
 		harness := commandHarness{
+			noLemonade: true,
 			mappings: portMappings{
 				{localPort: 8080, workstationPort: 80},
 				{localPort: 5432, workstationPort: 5432},
@@ -166,6 +167,7 @@ func TestStartTunnelsCancelsSiblingAfterFailure(t *testing.T) {
 	var siblingCancelled bool
 
 	harness := commandHarness{
+		noLemonade: true,
 		mappings: portMappings{
 			{localPort: 8080, workstationPort: 80},
 			{localPort: 5432, workstationPort: 5432},
@@ -188,4 +190,111 @@ func TestStartTunnelsCancelsSiblingAfterFailure(t *testing.T) {
 	mutex.Lock()
 	assert.True(t, siblingCancelled)
 	mutex.Unlock()
+}
+
+func TestTunnelMappingsIncludesLemonadeByDefault(t *testing.T) {
+	harness := commandHarness{
+		mappings: portMappings{{localPort: 8080, workstationPort: 80}},
+	}
+
+	assert.Equal(t, portMappings{
+		{localPort: 8080, workstationPort: 80},
+		{localPort: lemonadePort, workstationPort: lemonadePort},
+	}, harness.tunnelMappings())
+}
+
+func TestTunnelMappingsSkipsDuplicateLemonadeMapping(t *testing.T) {
+	harness := commandHarness{
+		mappings: portMappings{
+			{localPort: 8080, workstationPort: 80},
+			{localPort: lemonadePort, workstationPort: lemonadePort},
+		},
+	}
+
+	assert.Equal(t, harness.mappings, harness.tunnelMappings())
+}
+
+func TestTunnelMappingsOmitsLemonadeWhenDisabled(t *testing.T) {
+	harness := commandHarness{
+		noLemonade: true,
+		mappings:   portMappings{{localPort: 8080, workstationPort: 80}},
+	}
+
+	assert.Equal(t, harness.mappings, harness.tunnelMappings())
+}
+
+func TestMonitoredMappingsOmitLemonadePort(t *testing.T) {
+	harness := commandHarness{
+		mappings: portMappings{
+			{localPort: 8080, workstationPort: 80},
+			{localPort: lemonadePort, workstationPort: lemonadePort},
+		},
+	}
+
+	assert.Equal(t, portMappings{
+		{localPort: 8080, workstationPort: 80},
+	}, harness.monitoredMappings())
+}
+
+func TestMonitoredMappingsKeepLemonadeWhenDisabled(t *testing.T) {
+	harness := commandHarness{
+		noLemonade: true,
+		mappings: portMappings{
+			{localPort: 8080, workstationPort: 80},
+			{localPort: lemonadePort, workstationPort: lemonadePort},
+		},
+	}
+
+	assert.Equal(t, harness.mappings, harness.monitoredMappings())
+}
+
+func TestStartTunnelsIncludesLemonadeMapping(t *testing.T) {
+	started := make(chan string, 3)
+	release := make(chan struct{})
+	done := make(chan error, 1)
+
+	go func() {
+		harness := commandHarness{
+			mappings: portMappings{{localPort: 8080, workstationPort: 80}},
+			run: func(_ context.Context, _ string, arguments ...string) error {
+				started <- arguments[3]
+				<-release
+				return nil
+			},
+		}
+		done <- harness.startTunnels(t.Context())
+	}()
+
+	ports := []string{<-started, <-started}
+	assert.ElementsMatch(t, []string{"80", "2489"}, ports)
+	close(release)
+	require.NoError(t, <-done)
+}
+
+func TestStartLemonadeServerRunsAllowLocalhost(t *testing.T) {
+	var commandName string
+	var commandArguments []string
+	harness := commandHarness{
+		run: func(_ context.Context, name string, arguments ...string) error {
+			commandName = name
+			commandArguments = arguments
+			return nil
+		},
+	}
+
+	require.NoError(t, harness.startLemonadeServer(t.Context()))
+	assert.Equal(t, "lemonade", commandName)
+	assert.Equal(t, []string{"server", "-allow", "127.0.0.1"}, commandArguments)
+}
+
+func TestValidatePortMappingsIncludesImplicitLemonade(t *testing.T) {
+	harness := commandHarness{
+		mappings: portMappings{
+			{localPort: lemonadePort, workstationPort: 80},
+		},
+	}
+
+	err := harness.validatePortMappings()
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "local port 2489 is published more than once")
 }
