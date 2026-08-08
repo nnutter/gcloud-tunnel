@@ -253,12 +253,13 @@ func TestDashboardPreservesUnknownStatusAfterProbeTunnelStops(t *testing.T) {
 }
 
 func TestCommandHarnessAllocatesHiddenProbeMappings(t *testing.T) {
-	harness := commandHarness{mappings: portMappings{
+	mappings := portMappings{
 		{localPort: 8022, workstationPort: 22},
 		{localPort: 8080, workstationPort: 8080},
-	}}
+	}
+	harness := commandHarness{mappings: mappings, noLemonade: true}
 
-	probeMappings, err := harness.allocateProbeMappings()
+	probeMappings, err := harness.allocateProbeMappings(mappings)
 
 	require.NoError(t, err)
 	require.Len(t, probeMappings, 2)
@@ -267,6 +268,59 @@ func TestCommandHarnessAllocatesHiddenProbeMappings(t *testing.T) {
 	assert.NotEqual(t, probeMappings[0].localPort, probeMappings[1].localPort)
 	assert.Equal(t, uint16(22), probeMappings[0].workstationPort)
 	assert.Equal(t, uint16(8080), probeMappings[1].workstationPort)
+}
+
+func TestCommandHarnessDoesNotAllocateProbeMappingForLemonade(t *testing.T) {
+	harness := commandHarness{mappings: portMappings{
+		{localPort: 8080, workstationPort: 80},
+		{localPort: lemonadePort, workstationPort: lemonadePort},
+	}}
+	monitored := harness.monitoredMappings()
+
+	probeMappings, err := harness.allocateProbeMappings(monitored)
+
+	require.NoError(t, err)
+	require.Len(t, probeMappings, 1)
+	assert.Equal(t, uint16(80), probeMappings[0].workstationPort)
+	assert.NotEqual(t, lemonadePort, probeMappings[0].localPort)
+	assert.NotEqual(t, uint16(8080), probeMappings[0].localPort)
+}
+
+func TestStartLemonadeIsNoopWhenDisabled(t *testing.T) {
+	var calls int
+	harness := commandHarness{
+		noLemonade: true,
+		run: func(context.Context, string, ...string) error {
+			calls++
+			return nil
+		},
+	}
+
+	done := harness.startLemonade(t.Context())
+	<-done
+	assert.Zero(t, calls)
+}
+
+func TestStartLemonadeRunsServer(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	harness := commandHarness{
+		run: func(ctx context.Context, name string, arguments ...string) error {
+			assert.Equal(t, "lemonade", name)
+			assert.Equal(t, []string{"server", "-allow", "127.0.0.1"}, arguments)
+			close(started)
+			<-release
+			return ctx.Err()
+		},
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := harness.startLemonade(ctx)
+	<-started
+	cancel()
+	close(release)
+	<-done
 }
 
 func TestProbeTunnelFailureDoesNotCancelPrimaryTunnel(t *testing.T) {
@@ -312,7 +366,8 @@ func TestTunnelSupervisorRestartsTunnelGeneration(t *testing.T) {
 	rootContext, cancel := context.WithCancel(t.Context())
 	t.Cleanup(cancel)
 	harness := commandHarness{
-		mappings: portMappings{{localPort: 8080, workstationPort: 80}},
+		noLemonade: true,
+		mappings:   portMappings{{localPort: 8080, workstationPort: 80}},
 		run: func(ctx context.Context, _ string, arguments ...string) error {
 			localPort := uint16(8080)
 			if arguments[4] == "--local-host-port=localhost:50000" {

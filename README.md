@@ -3,6 +3,7 @@
 `gcloud-tunnel` publishes local TCP ports to a Google Cloud Workstation.
 It starts one `gcloud workstations start-tcp-tunnel` process for each published port.
 An inline dashboard displays every mapping instead of `gcloud` command output.
+By default it also starts `lemonade server -allow 127.0.0.1` and tunnels port `2489` for clipboard and open support.
 
 ## Install
 
@@ -39,6 +40,16 @@ The example forwards `localhost:8080` to workstation port `80` and `localhost:54
 
 `--cluster`, `--config`, `--region`, and at least one `--publish` mapping are required.
 Local ports and workstation ports must each be unique.
+
+## Lemonade
+
+Unless `--no-lemonade` is set, `gcloud-tunnel`:
+
+- starts `lemonade server -allow 127.0.0.1` for the session
+- always tunnels `2489:2489` in addition to any `--publish` mappings
+
+Port `2489` is omitted from the dashboard and is not probed, because lemonade is sensitive to probe connections.
+If you already publish `2489:2489`, it is not duplicated.
 
 ## Status
 

@@ -50,6 +50,7 @@ func newCommand() *cobra.Command {
 	flags.StringVar(&harness.config, "config", "", "Config for the workstation")
 	flags.StringVar(&harness.region, "region", "", "Region for the workstation")
 	flags.BoolVar(&harness.startWorkstation, "start-workstation", false, "Start the workstation if stopped")
+	flags.BoolVar(&harness.noLemonade, "no-lemonade", false, "Do not start lemonade server or tunnel port 2489")
 
 	flags.VarP(&harness.mappings, "publish", "p", "Publish LOCAL_PORT:WORKSTATION_PORT")
 

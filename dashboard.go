@@ -585,7 +585,9 @@ func (harness commandHarness) runDashboard(
 ) error {
 	tunnelContext, cancel := context.WithCancel(ctx)
 	defer cancel()
-	probeMappings, err := harness.allocateProbeMappings()
+
+	monitoredMappings := harness.monitoredMappings()
+	probeMappings, err := harness.allocateProbeMappings(monitoredMappings)
 	if err != nil {
 		return err
 	}
@@ -597,10 +599,12 @@ func (harness commandHarness) runDashboard(
 		restartRequests,
 	)
 
+	lemonadeDone := harness.startLemonade(tunnelContext)
+
 	program := tea.NewProgram(
 		newDashboard(dashboardConfig{
 			ctx:                tunnelContext,
-			mappings:           harness.mappings,
+			mappings:           monitoredMappings,
 			probeMappings:      probeMappings,
 			tunnelResults:      tunnelResults,
 			probeTunnelResults: probeTunnelResults,
@@ -616,6 +620,7 @@ func (harness commandHarness) runDashboard(
 	model, err := program.Run()
 	cancel()
 	<-tunnelsDone
+	<-lemonadeDone
 	if err != nil {
 		return err
 	}
@@ -624,6 +629,19 @@ func (harness commandHarness) runDashboard(
 		return nil
 	}
 	return dashboardError{err: failure}
+}
+
+func (harness commandHarness) startLemonade(ctx context.Context) <-chan struct{} {
+	done := make(chan struct{})
+	if harness.noLemonade {
+		close(done)
+		return done
+	}
+	go func() {
+		defer close(done)
+		_ = harness.startLemonadeServer(ctx)
+	}()
+	return done
 }
 
 func (harness commandHarness) superviseTunnels(
@@ -718,14 +736,17 @@ func (harness commandHarness) startTunnelGeneration(ctx context.Context) (<-chan
 	return results, done
 }
 
-func (harness commandHarness) allocateProbeMappings() (portMappings, error) {
-	occupiedPorts := make(set[uint16], len(harness.mappings)*2)
-	for _, mapping := range harness.mappings {
+func (harness commandHarness) allocateProbeMappings(mappings portMappings) (portMappings, error) {
+	occupiedPorts := make(set[uint16], (len(harness.mappings)+len(mappings))*2)
+	for _, mapping := range harness.tunnelMappings() {
+		occupiedPorts.add(mapping.localPort)
+	}
+	for _, mapping := range mappings {
 		occupiedPorts.add(mapping.localPort)
 	}
 
-	probeMappings := make(portMappings, len(harness.mappings))
-	for index, mapping := range harness.mappings {
+	probeMappings := make(portMappings, len(mappings))
+	for index, mapping := range mappings {
 		port, err := allocateProbePort(occupiedPorts)
 		if err != nil {
 			return nil, err
