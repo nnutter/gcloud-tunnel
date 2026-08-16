@@ -1,4 +1,4 @@
-name: Update Homebrew formula
+name: Update Tap
 
 on:
   release:
