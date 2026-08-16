@@ -151,4 +151,5 @@ jobs:
           gh pr merge \
             --repo "${TAP_OWNER}/${TAP_REPOSITORY}" \
             --auto \
+            --merge \
             "$BRANCH_NAME"
