@@ -139,3 +139,16 @@ jobs:
             --head "$BRANCH_NAME" \
             --base "$(gh repo view "$tap" --json defaultBranchRef --jq .defaultBranchRef.name)" \
             --body "Update ${FORMULA_NAME} to ${TAG} from ${UPSTREAM_REPOSITORY}."
+
+      - name: Enable auto-merge
+        if: steps.needed.outputs.needed == 'true'
+        env:
+          BRANCH_NAME: formula-updates/${{ env.FORMULA_NAME }}-${{ steps.release.outputs.tag }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAP_OWNER: ${{ env.TAP_OWNER }}
+          TAP_REPOSITORY: ${{ env.TAP_REPOSITORY }}
+        run: |
+          gh pr merge \
+            --repo "${TAP_OWNER}/${TAP_REPOSITORY}" \
+            --auto \
+            "$BRANCH_NAME"
